@@ -2,6 +2,8 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#import <CoreGraphics/CoreGraphics.h>
+#include "nvk_perf.h"
 #import <IOKit/IOKitLib.h>
 #include "native_drawable.h"
 #include <string.h>
@@ -57,6 +59,15 @@ static id<MTLDevice> metal_device(uint32_t vendor, uint32_t deviceID)
    return nil;
 }
 
+/* Display-GPU selection is opt-in. NVK rendering remains on NVIDIA. */
+static id<MTLDevice> metal_display_device(NSView *view)
+{
+   NSScreen *screen = view.window.screen ?: [NSScreen mainScreen];
+   NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+   if (!number) return nil;
+   return CGDirectDisplayCopyCurrentMetalDevice((CGDirectDisplayID)number.unsignedIntValue);
+}
+
 void nvk_native_bind_view(CGLContextObj context, void *pointer)
 {
    const char *mode = getenv("NVKZINK_PRESENT");
@@ -100,8 +111,21 @@ static void configure(NVKZinkTarget *target, uint32_t vendor, uint32_t deviceID,
    @synchronized(target) {
       NSView *view = target.view;
       target.pending = NO;
-      if (!view || !device) return;
+      if (!view) return;
+      const char *choice = getenv("NVKZINK_DRAWABLE_DEVICE");
+      if (choice && strcmp(choice, "display") == 0) {
+         /* Do not fall back silently if the display device is unavailable. */
+         device = metal_display_device(view);
+         if (!device) {
+            fprintf(stderr, "NVK Zink: requested display GPU has no Metal device\n");
+            return;
+         }
+      }
+      if (!device) return;
       if (!target.layer) {
+         fprintf(stderr, "NVK Zink: drawable Metal device=%s registry=%llu mode=%s\n",
+                 device.name.UTF8String, (unsigned long long)device.registryID,
+                 choice && strcmp(choice, "display") == 0 ? "display (experimental)" : "nvidia (default)");
          view.wantsLayer = YES;
          CAMetalLayer *layer = [CAMetalLayer layer];
          layer.frame = view.bounds;
@@ -169,12 +193,27 @@ int nvk_native_acquire(CGLContextObj context, uint32_t vendor, uint32_t deviceID
             if (target.width != width || target.height != height || target.deviceID != deviceID ||
                 target.opaque != (opaque != 0) || target.displaySync != displaySync) return 2;
          }
+         const int profiling = nvk_perf_enabled();
+         const uint64_t acquired_at = profiling ? nvk_perf_clock() : 0;
          id<CAMetalDrawable> drawable = [layer nextDrawable];
+         if (profiling) {
+            const uint64_t done_at = nvk_perf_clock();
+            static _Thread_local struct nvk_perf_stats stats;
+            static const char *const labels[4] = {"nextDrawable", NULL, NULL, NULL};
+            const double values[4] = {nvk_perf_ms(acquired_at, done_at), 0, 0, 0};
+            nvk_perf_record(&stats, "drawable", 1, labels, values);
+         }
          if (!drawable) return 2;
          id<MTLTexture> texture = drawable.texture;
          if (texture.width != width || texture.height != height) return 2;
          if (texture.device.registryID != layer.device.registryID || !texture.iosurface ||
-             texture.iosurfacePlane != 0 || texture.pixelFormat != MTLPixelFormatBGRA8Unorm) return 0;
+             texture.iosurfacePlane != 0 || texture.pixelFormat != MTLPixelFormatBGRA8Unorm) {
+            static dispatch_once_t warned;
+            dispatch_once(&warned, ^{
+               fprintf(stderr, "NVK Zink: incompatible drawable texture / IOSurface; no CPU fallback\n");
+            });
+            return 0;
+         }
          NVKZinkFrame *item = [NVKZinkFrame new];
          item.drawable = drawable; item.layer = layer;
          *surface = texture.iosurface;

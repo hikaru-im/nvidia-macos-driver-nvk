@@ -2,6 +2,7 @@
 #include "nvk_zink.h"
 #include "nvk_zink_private.h"
 #include "nvk_present.h"
+#include "nvk_perf.h"
 #include "zink/zink_screen.h"
 #include <stdio.h>
 #include "pipe/p_screen.h"
@@ -477,10 +478,24 @@ NVK_EXPORT int nvk_zink_present_native(struct nvk_zink_context *ctx, IOSurfaceRe
    struct pipe_resource *image = ctx->native_image;
    if (!image) return 0;
    int result = 0;
+   const int profiling = nvk_perf_enabled();
+   const uint64_t t0 = profiling ? nvk_perf_clock() : 0;
    /* Mesa already stores this default drawable with its top row first.
     * Apple GL presentation needs a flip; CAMetalLayer presentation does not. */
-   if (blit_default(ctx, image, 0, opaque) && finish(ctx))
+   int blitted = blit_default(ctx, image, 0, opaque);
+   const uint64_t t1 = profiling ? nvk_perf_clock() : 0;
+   int completed = blitted && finish(ctx);
+   const uint64_t t2 = profiling ? nvk_perf_clock() : 0;
+   if (completed)
       result = nvk_zink_copy_vram(ctx->screen->fscreen.screen, image, surface);
+   if (profiling) {
+      const uint64_t t3 = nvk_perf_clock();
+      static _Thread_local struct nvk_perf_stats stats;
+      static const char *const labels[4] = {"blit", "finish", "copy", "total"};
+      const double values[4] = {nvk_perf_ms(t0, t1), nvk_perf_ms(t1, t2),
+                                nvk_perf_ms(t2, t3), nvk_perf_ms(t0, t3)};
+      nvk_perf_record(&stats, "native", 4, labels, values);
+   }
    if (result < 0) p_atomic_set(&ctx->screen->uncertain, 1);
    return p_atomic_read(&ctx->screen->uncertain) ? -1 : result;
 }

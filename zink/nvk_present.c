@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "nvk_present.h"
+#include "nvk_perf.h"
 #include "nvk_zink.h"
 #include "zink/zink_screen.h"
 #include "zink/zink_resource.h"
@@ -93,6 +94,8 @@ int nvk_zink_copy_vram(struct pipe_screen *pscreen, struct pipe_resource *image,
    PFN_vkVoidFunction copy = screen->vk_GetDeviceProcAddr(screen->dev, "vkCmdCopyImageToBuffer");
    Dl_info origin = {0};
    if (!copy || !dladdr((void *)copy, &origin) || !origin.dli_fname) return 0;
+   const int profiling = nvk_perf_enabled();
+   const uint64_t t0 = profiling ? nvk_perf_clock() : 0;
    struct copy_frame *frame = calloc(1, sizeof(*frame));
    if (!frame) return 0;
    frame->renderer = dlopen(origin.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_FIRST | RTLD_NOLOAD);
@@ -210,11 +213,14 @@ int nvk_zink_copy_vram(struct pipe_screen *pscreen, struct pipe_resource *image,
       .commandBufferCount = 1, .pCommandBuffers = &command };
    /* Respect Zink's own queue lock, including other shared GL contexts and its
     * submission worker. The caller has already completed the scratch blit. */
+   const uint64_t t1 = profiling ? nvk_perf_clock() : 0;
    simple_mtx_lock(screen->queue_lock);
    result = screen->vk.QueueSubmit(screen->queue, 1, &submit, frame->fence);
    simple_mtx_unlock(screen->queue_lock);
+   const uint64_t t2 = profiling ? nvk_perf_clock() : 0;
    if (result == VK_SUCCESS)
       result = screen->vk.WaitForFences(screen->dev, 1, &frame->fence, VK_TRUE, 5000000000ull);
+   const uint64_t t3 = profiling ? nvk_perf_clock() : 0;
    nvk_zink_present_observer observer = atomic_load(&present_observer);
    int observed = 1;
    if (result == VK_SUCCESS && observer) {
@@ -246,6 +252,14 @@ int nvk_zink_copy_vram(struct pipe_screen *pscreen, struct pipe_resource *image,
       published = observed && dirty(screen->dev, IOSurfaceGetID(surface), 0) == 0 && publish_tag(surface);
    }
    release_frame(screen, frame);
+   if (profiling) {
+      const uint64_t t4 = nvk_perf_clock();
+      static _Thread_local struct nvk_perf_stats stats;
+      static const char *const labels[4] = {"setup", "submit", "wait", "publishRetire"};
+      const double values[4] = {nvk_perf_ms(t0, t1), nvk_perf_ms(t1, t2),
+                                nvk_perf_ms(t2, t3), nvk_perf_ms(t3, t4)};
+      nvk_perf_record(&stats, "copy", 4, labels, values);
+   }
    return published;
 failed:
    release_frame(screen, frame);
